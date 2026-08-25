@@ -462,8 +462,12 @@ def export_database_to_multi_sheet_excel():
     try:
         products_df = pd.read_sql_query("SELECT * FROM products", conn)
         entries_df = pd.read_sql_query("SELECT * FROM stock_entries", conn)
+        contacts_df = pd.read_sql_query("SELECT * FROM contacts", conn)
     finally:
         conn.close()
+
+    entry_cols = ["entry_date", "movement_type", "quantity", "unit", "price", "note"]
+    contact_cols = ["name", "surname", "phone", "email", "country"]
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -471,18 +475,27 @@ def export_database_to_multi_sheet_excel():
             writer, sheet_name="Master_Inventory", index=False
         )
 
+        contacts_export = contacts_df.merge(
+            products_df[["id", "product", "sku"]],
+            left_on="product_id",
+            right_on="id",
+            how="left",
+            suffixes=("", "_product"),
+        )
+        if contacts_export.empty:
+            contacts_export = pd.DataFrame(columns=["product", "sku"] + contact_cols)
+        else:
+            contacts_export = contacts_export[["product", "sku"] + contact_cols]
+        contacts_export.to_excel(writer, sheet_name="Contacts", index=False)
+
         for _, prod in products_df.iterrows():
             prod_entries = entries_df[entries_df["product_id"] == prod["id"]]
             sheet_title = sanitize_filename(f"{prod['product']}")
 
             if prod_entries.empty:
-                prod_entries = pd.DataFrame(
-                    columns=["entry_date", "quantity", "price", "note"]
-                )
+                prod_entries = pd.DataFrame(columns=entry_cols)
             else:
-                prod_entries = prod_entries[
-                    ["entry_date", "quantity", "price", "note"]
-                ]
+                prod_entries = prod_entries[entry_cols].sort_values("entry_date", ascending=False)
 
             prod_entries.to_excel(
                 writer, sheet_name=sheet_title, index=False
@@ -501,11 +514,12 @@ def import_excel_to_database(uploaded_file):
             try:
                 conn.execute("DELETE FROM products")
                 conn.execute("DELETE FROM stock_entries")
+                conn.execute("DELETE FROM contacts")
 
                 p_df.to_sql("products", conn, if_exists="append", index=False)
 
                 db_prods = pd.read_sql_query(
-                    "SELECT id, product FROM products", conn
+                    "SELECT id, product, sku FROM products", conn
                 )
 
                 for _, prod_row in db_prods.iterrows():
@@ -522,6 +536,23 @@ def import_excel_to_database(uploaded_file):
                                 if_exists="append",
                                 index=False,
                             )
+
+                if "Contacts" in excel_file.sheet_names:
+                    c_df = pd.read_excel(excel_file, sheet_name="Contacts")
+                    if not c_df.empty and "sku" in c_df.columns:
+                        c_df = c_df.merge(
+                            db_prods[["id", "sku"]], on="sku", how="left"
+                        )
+                        c_df = c_df.rename(columns={"id": "product_id"})
+                        c_df = c_df.dropna(subset=["product_id"])
+                        contact_cols = [
+                            "product_id", "name", "surname", "phone", "email", "country"
+                        ]
+                        c_df = c_df[[col for col in contact_cols if col in c_df.columns]]
+                        c_df.to_sql(
+                            "contacts", conn, if_exists="append", index=False
+                        )
+
                 conn.commit()
             finally:
                 conn.close()
@@ -607,7 +638,7 @@ def load_products():
     try:
         df = pd.read_sql_query("SELECT * FROM products", conn)
         contacts_df = pd.read_sql_query(
-            "SELECT product_id, name, surname FROM contacts", conn
+            "SELECT product_id, name, surname, phone, email, country FROM contacts", conn
         )
     finally:
         conn.close()
@@ -617,12 +648,19 @@ def load_products():
         axis=1,
     )
 
+    def format_contact(row):
+        parts = [
+            f"{(row['name'] or '').strip()} {(row['surname'] or '').strip()}".strip(),
+            row["phone"] or "",
+            row["email"] or "",
+            row["country"] or "",
+        ]
+        return " | ".join(p for p in parts if p)
+
     contacts_summary = (
-        contacts_df.assign(
-            full_name=lambda d: (d["name"].fillna("") + " " + d["surname"].fillna("")).str.strip()
-        )
-        .groupby("product_id")["full_name"]
-        .apply(lambda names: ", ".join(n for n in names if n))
+        contacts_df.assign(contact_line=contacts_df.apply(format_contact, axis=1))
+        .groupby("product_id")["contact_line"]
+        .apply(lambda lines: "; ".join(l for l in lines if l))
     )
     df["contacts"] = df["id"].map(contacts_summary).fillna("")
 
@@ -779,16 +817,23 @@ with tab2:
                 "icon",
                 "sku",
                 "product",
+                "description",
                 "characteristics",
+                "where_used",
                 "suppliers",
+                "source_origin",
+                "batch_lot",
+                "sds_hazard_class",
                 "delivery_time",
                 "delivery_time_unit",
+                "expiring_date",
                 "price",
                 "discount",
                 "transport_price",
                 "landed_cost",
                 "quantity",
                 "unit",
+                "monthly_usage",
                 "min_stock",
                 "ubication",
                 "contacts",
@@ -803,7 +848,9 @@ with tab2:
                 "Stock Unit", options=["m", "kg", "rolls", "pieces", "boxes"]
             ),
             "contacts": st.column_config.TextColumn(
-                "Contacts", help="Edit contacts from the product's Details & History modal"
+                "Contacts (Name | Phone | Email | Country)",
+                help="Edit contacts from the product's Details & History modal",
+                width="large",
             ),
         },
         width="stretch",
@@ -815,24 +862,32 @@ with tab2:
             execute_db_query(
                 """
                 UPDATE products SET
-                    icon = ?, product = ?, characteristics = ?, suppliers = ?,
-                    delivery_time = ?, delivery_time_unit = ?,
+                    icon = ?, product = ?, description = ?, characteristics = ?, where_used = ?,
+                    suppliers = ?, source_origin = ?, batch_lot = ?, sds_hazard_class = ?,
+                    delivery_time = ?, delivery_time_unit = ?, expiring_date = ?,
                     price = ?, discount = ?, transport_price = ?,
-                    quantity = ?, unit = ?, min_stock = ?, ubication = ?
+                    quantity = ?, unit = ?, monthly_usage = ?, min_stock = ?, ubication = ?
                 WHERE id = ?
                 """,
                 (
                     r["icon"],
                     r["product"],
+                    r["description"],
                     r["characteristics"],
+                    r["where_used"],
                     r["suppliers"],
+                    r["source_origin"],
+                    r["batch_lot"],
+                    r["sds_hazard_class"],
                     safe_int(r["delivery_time"]),
                     r["delivery_time_unit"],
+                    r["expiring_date"],
                     safe_float(r["price"]),
                     safe_float(r["discount"]),
                     safe_float(r["transport_price"]),
                     safe_float(r["quantity"]),
                     r["unit"],
+                    safe_int(r["monthly_usage"]),
                     safe_int(r["min_stock"]),
                     r["ubication"],
                     r["id"],
