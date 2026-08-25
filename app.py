@@ -606,6 +606,9 @@ def load_products():
     conn = get_db_connection()
     try:
         df = pd.read_sql_query("SELECT * FROM products", conn)
+        contacts_df = pd.read_sql_query(
+            "SELECT product_id, name, surname FROM contacts", conn
+        )
     finally:
         conn.close()
 
@@ -613,6 +616,16 @@ def load_products():
         lambda r: calc_landed_cost(r["price"], r["discount"], r["transport_price"]),
         axis=1,
     )
+
+    contacts_summary = (
+        contacts_df.assign(
+            full_name=lambda d: (d["name"].fillna("") + " " + d["surname"].fillna("")).str.strip()
+        )
+        .groupby("product_id")["full_name"]
+        .apply(lambda names: ", ".join(n for n in names if n))
+    )
+    df["contacts"] = df["id"].map(contacts_summary).fillna("")
+
     return df
 
 
@@ -768,16 +781,31 @@ with tab2:
                 "product",
                 "characteristics",
                 "suppliers",
+                "delivery_time",
+                "delivery_time_unit",
                 "price",
                 "discount",
                 "transport_price",
                 "landed_cost",
                 "quantity",
+                "unit",
                 "min_stock",
                 "ubication",
+                "contacts",
             ]
         ],
-        disabled=["id", "sku", "landed_cost"],
+        disabled=["id", "sku", "landed_cost", "contacts"],
+        column_config={
+            "delivery_time_unit": st.column_config.SelectboxColumn(
+                "Delivery Unit", options=["days", "weeks"]
+            ),
+            "unit": st.column_config.SelectboxColumn(
+                "Stock Unit", options=["m", "kg", "rolls", "pieces", "boxes"]
+            ),
+            "contacts": st.column_config.TextColumn(
+                "Contacts", help="Edit contacts from the product's Details & History modal"
+            ),
+        },
         width="stretch",
         hide_index=True,
     )
@@ -788,8 +816,9 @@ with tab2:
                 """
                 UPDATE products SET
                     icon = ?, product = ?, characteristics = ?, suppliers = ?,
+                    delivery_time = ?, delivery_time_unit = ?,
                     price = ?, discount = ?, transport_price = ?,
-                    quantity = ?, min_stock = ?, ubication = ?
+                    quantity = ?, unit = ?, min_stock = ?, ubication = ?
                 WHERE id = ?
                 """,
                 (
@@ -797,10 +826,13 @@ with tab2:
                     r["product"],
                     r["characteristics"],
                     r["suppliers"],
+                    safe_int(r["delivery_time"]),
+                    r["delivery_time_unit"],
                     safe_float(r["price"]),
                     safe_float(r["discount"]),
                     safe_float(r["transport_price"]),
                     safe_float(r["quantity"]),
+                    r["unit"],
                     safe_int(r["min_stock"]),
                     r["ubication"],
                     r["id"],
