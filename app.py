@@ -12,6 +12,7 @@ from openpyxl.chart import BarChart, LineChart, Reference
 # APP CONFIG & SAFE DIRECTORY SETUP
 # -----------------------------------------------------------------------------
 st.set_page_config(
+    
     page_title="Material Inventory System",
     page_icon="📦",
     layout="wide",
