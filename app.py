@@ -58,33 +58,16 @@ def sanitize_filename(name):
     return clean[:30]
 
 
+def ensure_column(cursor, table, column, column_def):
+    cursor.execute(f"PRAGMA table_info({table})")
+    existing_cols = [row[1] for row in cursor.fetchall()]
+    if column not in existing_cols:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_def}")
+
+
 def init_db():
     with get_db_connection() as conn:
         cursor = conn.cursor()
-
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='products'")
-        table_exists = cursor.fetchone()
-
-        if table_exists:
-            cursor.execute("PRAGMA table_info(products)")
-            columns = [column[1] for column in cursor.fetchall()]
-            required_cols = [
-                "sds_hazard_class", "source_origin", "batch_lot", "where_used",
-                "unit", "delivery_time_unit",
-            ]
-            if not all(col in columns for col in required_cols):
-                cursor.execute("DROP TABLE IF EXISTS products")
-                cursor.execute("DROP TABLE IF EXISTS stock_entries")
-                cursor.execute("DROP TABLE IF EXISTS contacts")
-
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='stock_entries'")
-        stock_table_exists = cursor.fetchone()
-
-        if stock_table_exists:
-            cursor.execute("PRAGMA table_info(stock_entries)")
-            se_columns = [column[1] for column in cursor.fetchall()]
-            if "unit" not in se_columns or "movement_type" not in se_columns:
-                cursor.execute("DROP TABLE IF EXISTS stock_entries")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS products (
@@ -141,6 +124,22 @@ def init_db():
                 FOREIGN KEY (product_id) REFERENCES products (id) ON DELETE CASCADE
             )
         """)
+
+        for col, col_def in [
+            ("delivery_time_unit", "TEXT DEFAULT 'days'"),
+            ("unit", "TEXT DEFAULT 'pieces'"),
+            ("source_origin", "TEXT"),
+            ("batch_lot", "TEXT"),
+            ("sds_hazard_class", "TEXT"),
+            ("where_used", "TEXT"),
+        ]:
+            ensure_column(cursor, "products", col, col_def)
+
+        for col, col_def in [
+            ("unit", "TEXT DEFAULT 'pieces'"),
+            ("movement_type", "TEXT DEFAULT 'IN'"),
+        ]:
+            ensure_column(cursor, "stock_entries", col, col_def)
 
         cursor.execute("SELECT COUNT(*) FROM products")
         if cursor.fetchone()[0] == 0:
