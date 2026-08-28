@@ -1,18 +1,19 @@
 import io
 import os
 import re
-import sqlite3
 from datetime import datetime
 import altair as alt
 import pandas as pd
+import psycopg
 import streamlit as st
+from psycopg.rows import dict_row
+from sqlalchemy import create_engine, text
 from openpyxl.chart import BarChart, LineChart, Reference
 
 # -----------------------------------------------------------------------------
 # APP CONFIG & SAFE DIRECTORY SETUP
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    
     page_title="Material Inventory System",
     page_icon="📦",
     layout="wide",
@@ -20,7 +21,6 @@ st.set_page_config(
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.path.join(BASE_DIR, "inventory.db")
 IMAGES_DIR = os.path.join(BASE_DIR, "images")
 DATASHEETS_DIR = os.path.join(BASE_DIR, "datasheets")
 
@@ -31,23 +31,69 @@ for folder_path in [IMAGES_DIR, DATASHEETS_DIR]:
 
 
 # -----------------------------------------------------------------------------
-# DATABASE CONNECTION & MUTATION HELPERS
+# DATABASE CONNECTION & MUTATION HELPERS (Postgres via Neon)
 # -----------------------------------------------------------------------------
+RAW_DATABASE_URL = st.secrets["DATABASE_URL"]
+
+# SQLAlchemy engine — used only where pandas needs it (read_sql_query / to_sql).
+SQLALCHEMY_URL = RAW_DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+DB_ENGINE = create_engine(SQLALCHEMY_URL, pool_pre_ping=True)
+
+
+class PGConnection:
+    """Thin sqlite3.Connection-style wrapper around a psycopg connection.
+
+    Lets the rest of the app keep using `conn.execute("... ? ...", (params,))`
+    and dict-like row access (`row["col"]`) exactly as it did with sqlite3.
+    """
+
+    def __init__(self, raw_conn):
+        self._conn = raw_conn
+
+    def execute(self, query, params=()):
+        cur = self._conn.cursor()
+        cur.execute(query.replace("?", "%s"), tuple(params))
+        return cur
+
+    def cursor(self):
+        return self._conn.cursor()
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self._conn.commit()
+        else:
+            self._conn.rollback()
+        self._conn.close()
+
+
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    return conn
+    raw_conn = psycopg.connect(RAW_DATABASE_URL, row_factory=dict_row, autocommit=False)
+    return PGConnection(raw_conn)
 
 
 def execute_db_query(query, params=()):
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute(query, params)
+        pg_query = query.replace("?", "%s")
+        is_insert = pg_query.strip().upper().startswith("INSERT")
+        if is_insert and "RETURNING" not in pg_query.upper():
+            pg_query += " RETURNING id"
+        cursor.execute(pg_query, tuple(params))
+        last_id = None
+        if is_insert:
+            row = cursor.fetchone()
+            last_id = row["id"] if row else None
         conn.commit()
-        last_id = cursor.lastrowid
         return last_id
     finally:
         conn.close()
@@ -59,10 +105,7 @@ def sanitize_filename(name):
 
 
 def ensure_column(cursor, table, column, column_def):
-    cursor.execute(f"PRAGMA table_info({table})")
-    existing_cols = [row[1] for row in cursor.fetchall()]
-    if column not in existing_cols:
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_def}")
+    cursor.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {column_def}")
 
 
 def init_db():
@@ -71,7 +114,7 @@ def init_db():
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 icon TEXT DEFAULT '📦',
                 sku TEXT UNIQUE NOT NULL,
                 product TEXT NOT NULL,
@@ -100,7 +143,7 @@ def init_db():
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS stock_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 product_id INTEGER NOT NULL,
                 entry_date TEXT NOT NULL,
                 quantity REAL NOT NULL,
@@ -114,7 +157,7 @@ def init_db():
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS contacts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 product_id INTEGER NOT NULL,
                 name TEXT,
                 surname TEXT,
@@ -141,8 +184,8 @@ def init_db():
         ]:
             ensure_column(cursor, "stock_entries", col, col_def)
 
-        cursor.execute("SELECT COUNT(*) FROM products")
-        if cursor.fetchone()[0] == 0:
+        cursor.execute("SELECT COUNT(*) AS cnt FROM products")
+        if cursor.fetchone()["cnt"] == 0:
             seed_data = [
                 (
                     "🏷️",
@@ -405,16 +448,17 @@ def init_db():
                         icon, sku, product, characteristics, suppliers, price, discount, transport_price,
                         expiring_date, delivery_time, ubication, monthly_usage, min_stock, quantity,
                         description, where_used, source_origin, batch_lot, sds_hazard_class
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
                 """,
                     item,
                 )
 
-                prod_id = cursor.lastrowid
+                prod_id = cursor.fetchone()["id"]
                 cursor.execute(
                     """
                     INSERT INTO stock_entries (product_id, entry_date, quantity, unit, movement_type, price, note)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                     (
                         prod_id,
@@ -460,13 +504,10 @@ def safe_int(value, default=0):
 # ADVANCED MULTI-SHEET EXCEL EXPORT & IMPORT
 # -----------------------------------------------------------------------------
 def export_database_to_multi_sheet_excel():
-    conn = get_db_connection()
-    try:
+    with DB_ENGINE.connect() as conn:
         products_df = pd.read_sql_query("SELECT * FROM products", conn)
         entries_df = pd.read_sql_query("SELECT * FROM stock_entries", conn)
         contacts_df = pd.read_sql_query("SELECT * FROM contacts", conn)
-    finally:
-        conn.close()
 
     entry_cols = ["entry_date", "movement_type", "quantity", "unit", "price", "note"]
     contact_cols = ["name", "surname", "phone", "email", "country"]
@@ -519,13 +560,18 @@ def import_excel_to_database(uploaded_file, es=False):
 
         if "Master_Inventory" in excel_file.sheet_names:
             p_df = pd.read_excel(excel_file, sheet_name="Master_Inventory")
-            conn = get_db_connection()
-            try:
-                conn.execute("DELETE FROM products")
-                conn.execute("DELETE FROM stock_entries")
-                conn.execute("DELETE FROM contacts")
+            with DB_ENGINE.connect() as conn:
+                conn.execute(text("DELETE FROM contacts"))
+                conn.execute(text("DELETE FROM stock_entries"))
+                conn.execute(text("DELETE FROM products"))
 
                 p_df.to_sql("products", conn, if_exists="append", index=False)
+                conn.execute(
+                    text(
+                        "SELECT setval(pg_get_serial_sequence('products', 'id'), "
+                        "COALESCE((SELECT MAX(id) FROM products), 1))"
+                    )
+                )
 
                 db_prods = pd.read_sql_query(
                     "SELECT id, product, sku FROM products", conn
@@ -547,6 +593,12 @@ def import_excel_to_database(uploaded_file, es=False):
                                 if_exists="append",
                                 index=False,
                             )
+                conn.execute(
+                    text(
+                        "SELECT setval(pg_get_serial_sequence('stock_entries', 'id'), "
+                        "COALESCE((SELECT MAX(id) FROM stock_entries), 1))"
+                    )
+                )
 
                 if "Contacts" in excel_file.sheet_names:
                     c_df = pd.read_excel(excel_file, sheet_name="Contacts")
@@ -563,10 +615,14 @@ def import_excel_to_database(uploaded_file, es=False):
                         c_df.to_sql(
                             "contacts", conn, if_exists="append", index=False
                         )
+                        conn.execute(
+                            text(
+                                "SELECT setval(pg_get_serial_sequence('contacts', 'id'), "
+                                "COALESCE((SELECT MAX(id) FROM contacts), 1))"
+                            )
+                        )
 
                 conn.commit()
-            finally:
-                conn.close()
 
         return True, (
             "¡Base de datos multi-hoja importada correctamente!"
@@ -591,18 +647,17 @@ ICON_OPTIONS = [
 
 
 def get_stock_history_df(product_id):
-    conn = get_db_connection()
-    try:
+    with DB_ENGINE.connect() as conn:
         df = pd.read_sql_query(
-            """
-            SELECT entry_date, movement_type, quantity, unit, price, note
-            FROM stock_entries WHERE product_id = ? ORDER BY entry_date, id
-            """,
+            text(
+                """
+                SELECT entry_date, movement_type, quantity, unit, price, note
+                FROM stock_entries WHERE product_id = :pid ORDER BY entry_date, id
+                """
+            ),
             conn,
-            params=(product_id,),
+            params={"pid": product_id},
         )
-    finally:
-        conn.close()
 
     if df.empty:
         return df
@@ -786,14 +841,11 @@ with col_header:
 # DATA LOAD & FILTERING
 # -----------------------------------------------------------------------------
 def load_products():
-    conn = get_db_connection()
-    try:
+    with DB_ENGINE.connect() as conn:
         df = pd.read_sql_query("SELECT * FROM products", conn)
         contacts_df = pd.read_sql_query(
             "SELECT product_id, name, surname, phone, email, country FROM contacts", conn
         )
-    finally:
-        conn.close()
 
     df["landed_cost"] = df.apply(
         lambda r: calc_landed_cost(r["price"], r["discount"], r["transport_price"]),
@@ -809,12 +861,15 @@ def load_products():
         ]
         return " | ".join(p for p in parts if p)
 
-    contacts_summary = (
-        contacts_df.assign(contact_line=contacts_df.apply(format_contact, axis=1))
-        .groupby("product_id")["contact_line"]
-        .apply(lambda lines: "; ".join(l for l in lines if l))
-    )
-    df["contacts"] = df["id"].map(contacts_summary).fillna("")
+    if contacts_df.empty:
+        df["contacts"] = ""
+    else:
+        contacts_summary = (
+            contacts_df.assign(contact_line=contacts_df.apply(format_contact, axis=1))
+            .groupby("product_id")["contact_line"]
+            .apply(lambda lines: "; ".join(l for l in lines if l))
+        )
+        df["contacts"] = df["id"].map(contacts_summary).fillna("")
 
     return df
 
